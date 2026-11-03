@@ -1,0 +1,25 @@
+# Example deployment. Replace the image owner and the hostname, then:
+#   docker compose up -d
+services:
+  derper:
+    image: ghcr.io/shouyupedia/derper:latest
+    container_name: derper
+    restart: unless-stopped
+    environment:
+      DERP_HOSTNAME: derp.example.com   # public DNS name of this server (required)
+      DERP_CERT_MODE: letsencrypt       # letsencrypt | manual
+      # DERP_ACME_EMAIL: you@example.com
+      # DERP_VERIFY_CLIENTS: "true"     # needs the tailscaled socket mounted below
+      # DERP_EXTRA_ARGS: --home blank
+    ports:
+      - "80:80"        # HTTP (ACME HTTP-01 challenge and captive-portal checks)
+      - "443:443"      # DERP over HTTPS
+      - "3478:3478/udp" # STUN
+    volumes:
+      - derper-data:/var/lib/derper   # DERP private key
+      - derper-certs:/app/certs       # ACME certificates (or your own *.crt/*.key when DERP_CERT_MODE=manual)
+      # - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+
+volumes:
+  derper-data:
+  derper-certs:
