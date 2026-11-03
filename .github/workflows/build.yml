@@ -1,6 +1,5 @@
 # Builds Tailscale's DERP relay (cmd/derper) from the latest upstream release
-# with the latest stable Go, and publishes a multi-arch image to GHCR
-# (optionally also Docker Hub).
+# with the latest stable Go, and publishes a multi-arch image to GHCR.
 #
 # Every run first resolves the current upstream versions. One build is keyed by
 # the pair "<tailscale tag>-go<go version>" (for example v1.104.5-go1.27.3), so a
@@ -50,8 +49,6 @@ jobs:
   resolve:
     name: Resolve upstream versions
     runs-on: ubuntu-latest
-    env:
-      DOCKERHUB_ENABLED: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     outputs:
       build: ${{ steps.decide.outputs.build }}
       reason: ${{ steps.decide.outputs.reason }}
@@ -86,15 +83,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ github.token }}
-
-      # Optional: authenticated Docker Hub checks are not subject to the
-      # anonymous pull rate limit.
-      - name: Log in to Docker Hub
-        if: env.DOCKERHUB_ENABLED == 'true'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Decide whether to build
         id: decide
@@ -161,9 +149,6 @@ jobs:
     if: needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-latest
     env:
-      # Docker Hub publishing is optional: add DOCKERHUB_USERNAME and
-      # DOCKERHUB_TOKEN repository secrets to enable it.
-      DOCKERHUB_ENABLED: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
       IMAGE: ${{ needs.resolve.outputs.image }}
       IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
       TS_VERSION: ${{ needs.resolve.outputs.ts_version }}
@@ -183,22 +168,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Log in to Docker Hub
-        if: env.DOCKERHUB_ENABLED == 'true'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@v6
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
-          images: |
-            ${{ env.IMAGE }}
-            name=docker.io/${{ secrets.DOCKERHUB_USERNAME || 'unused' }}/${{ env.IMAGE_NAME }},enable=${{ env.DOCKERHUB_ENABLED == 'true' }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest
             type=raw,value=${{ env.TS_VERSION }}

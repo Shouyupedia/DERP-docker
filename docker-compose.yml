@@ -1,24 +1,39 @@
-# Example deployment. Replace the image owner and the hostname, then:
-#   docker compose up -d
+# Tailscale DERP relay — Docker Compose example.
+#
+# 1. Point a public DNS name (A/AAAA record) at this host.
+# 2. Replace derp.example.com below and open TCP 80, TCP 443 and UDP 3478.
+# 3. docker compose up -d
+#
+# derper obtains a Let's Encrypt certificate automatically (HTTP-01 challenge on
+# port 80). Add the server to your tailnet's ACL "derpMap" afterwards.
 services:
   derper:
     image: ghcr.io/shouyupedia/derper:latest
     container_name: derper
     restart: unless-stopped
     environment:
-      DERP_HOSTNAME: derp.example.com   # public DNS name of this server (required)
-      DERP_CERT_MODE: letsencrypt       # letsencrypt | manual
-      # DERP_ACME_EMAIL: you@example.com
-      # DERP_VERIFY_CLIENTS: "true"     # needs the tailscaled socket mounted below
-      # DERP_EXTRA_ARGS: --home blank
+      DERP_HOSTNAME: derp.example.com     # public DNS name of this server (required)
+      DERP_CERT_MODE: letsencrypt         # letsencrypt | manual (put <hostname>.crt/.key in /app/certs)
+      DERP_ACME_EMAIL: ""                 # optional contact address for Let's Encrypt
+      DERP_STUN: "true"                   # STUN on UDP 3478
+      DERP_VERIFY_CLIENTS: "false"        # "true" restricts access to your own tailnet; see below
+      # DERP_EXTRA_ARGS: --home blank     # any other derper flag
     ports:
-      - "80:80"        # HTTP (ACME HTTP-01 challenge and captive-portal checks)
-      - "443:443"      # DERP over HTTPS
-      - "3478:3478/udp" # STUN
+      - "80:80"                           # HTTP: ACME challenge, captive-portal checks
+      - "443:443"                         # DERP over HTTPS
+      - "3478:3478/udp"                   # STUN
     volumes:
-      - derper-data:/var/lib/derper   # DERP private key
-      - derper-certs:/app/certs       # ACME certificates (or your own *.crt/*.key when DERP_CERT_MODE=manual)
+      - derper-data:/var/lib/derper       # DERP private key (keep it, it identifies this node)
+      - derper-certs:/app/certs           # ACME certificate cache, or your own certs in manual mode
+      # To enable DERP_VERIFY_CLIENTS, run tailscaled on the host and mount its socket:
       # - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+    healthcheck:
+      # /generate_204 is served on the plain-HTTP port; adjust if you change DERP_HTTP_PORT.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/generate_204"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   derper-data:

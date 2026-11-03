@@ -1,10 +1,10 @@
 # DERP-docker
 
 自动把 [Tailscale](https://github.com/tailscale/tailscale) 的 DERP 中继服务器 `cmd/derper`
-从上游源码编译成多架构 Docker 镜像并发布。GitHub Actions 定时检查上游，**Tailscale 发布新版本，
+从上游源码编译成多架构 Docker 镜像并发布到 GHCR。GitHub Actions 定时检查上游，**Tailscale 发布新版本，
 或 Go 发布新版本时，自动重新拉取、构建并推送镜像**。
 
-- 镜像：`ghcr.io/<owner>/derper`（可选同步发布到 Docker Hub）
+- 镜像：`ghcr.io/<owner>/derper`
 - 架构：`linux/amd64`、`linux/arm64`、`linux/arm/v7`
 - 运行时：Alpine，自带 CA 证书，可 `docker exec` 进入排查
 
@@ -50,10 +50,9 @@
 1. 把本仓库推到 GitHub，默认分支为 `main`（定时任务只在默认分支运行）。
 2. 在 Actions 页面手动运行一次 **Build derper image**，或等待定时触发。
 3. 首次推送后 GHCR 包默认是 **私有** 的：到仓库的 Packages → `derper` → Package settings 把可见性改为 Public。
-4. （可选）同步发布到 Docker Hub：在仓库 Secrets 里添加 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`，
-   工作流会自动额外推送到 `docker.io/<用户名>/derper`。
 
-工作流需要的权限（已在文件中声明）：`packages: write` 推送镜像，`contents: write` 提交 `versions.json`。
+工作流只需要 `GITHUB_TOKEN`，不需要配置任何 Secret。用到的权限（已在文件中声明）：`packages: write`
+推送镜像，`contents: write` 提交 `versions.json`。
 如果 `main` 开了分支保护不允许 bot 推送，“Record published versions” 这一步会失败但不影响镜像发布，
 也可以直接删掉这一步并把权限降为 `contents: read`。
 
@@ -62,6 +61,70 @@
 > 点一下 Enable workflow 即可。
 
 ## 使用
+
+前提：一个指向这台机器的公网域名（A/AAAA 记录），并放行 TCP 80、TCP 443、UDP 3478。
+
+### Docker Compose
+
+仓库里的 `docker-compose.yml` 可直接使用，把 `derp.example.com` 换成你的域名后 `docker compose up -d`：
+
+```yaml
+services:
+  derper:
+    image: ghcr.io/shouyupedia/derper:latest
+    container_name: derper
+    restart: unless-stopped
+    environment:
+      DERP_HOSTNAME: derp.example.com     # 本机公网域名（必填）
+      DERP_CERT_MODE: letsencrypt         # 自动申请 Let's Encrypt 证书
+      DERP_ACME_EMAIL: ""                 # 可选，ACME 联系邮箱
+      DERP_STUN: "true"
+      DERP_VERIFY_CLIENTS: "false"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "3478:3478/udp"
+    volumes:
+      - derper-data:/var/lib/derper       # DERP 私钥，请妥善保留
+      - derper-certs:/app/certs           # 证书缓存
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/generate_204"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  derper-data:
+  derper-certs:
+```
+
+**自备证书**（不走 Let's Encrypt，例如 443 前面已有反代或内网环境）：把 `derp.example.com.crt` 和
+`derp.example.com.key` 放到挂载目录，并改为：
+
+```yaml
+    environment:
+      DERP_HOSTNAME: derp.example.com
+      DERP_CERT_MODE: manual
+    volumes:
+      - derper-data:/var/lib/derper
+      - ./certs:/app/certs:ro
+```
+
+**只允许自己 tailnet 的设备使用**（推荐，防止被别人白嫖）：宿主机先安装并登录 tailscaled，再把它的
+socket 挂进容器并打开校验：
+
+```yaml
+    environment:
+      DERP_HOSTNAME: derp.example.com
+      DERP_VERIFY_CLIENTS: "true"
+    volumes:
+      - derper-data:/var/lib/derper
+      - derper-certs:/app/certs
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+```
+
+### docker run
 
 ```bash
 docker run -d --name derper --restart unless-stopped \
@@ -72,7 +135,7 @@ docker run -d --name derper --restart unless-stopped \
   ghcr.io/<owner>/derper:latest
 ```
 
-或使用仓库里的 `docker-compose.yml`。
+启动后在 Tailscale 管理后台的 ACL 里把它加进 `derpMap` 即可使用。
 
 ### 环境变量
 
@@ -101,8 +164,6 @@ docker run --rm ghcr.io/<owner>/derper:latest --version
 docker run ... ghcr.io/<owner>/derper:latest --hostname derp.example.com --certmode manual
 ```
 
-- `DERP_CERT_MODE=manual` 时，把 `derp.example.com.crt` 和 `derp.example.com.key` 放进 `/app/certs`。
-- `DERP_VERIFY_CLIENTS=true` 需要把宿主机的 `/var/run/tailscale/tailscaled.sock` 挂进容器同一路径。
 - 容器以 root 运行（derper 默认把私钥放在 `/var/lib/derper/derper.key`，并需要绑定 80/443）。
 
 ## 本地构建
@@ -128,5 +189,5 @@ docker build --build-arg TS_VERSION=v1.104.5 --build-arg GO_VERSION=1.27.3 -t de
 | `scripts/test-resolve-versions.sh` | 上述脚本的测试 |
 | `Dockerfile` | 两阶段构建：Debian golang 镜像交叉编译 → Alpine 运行时 |
 | `docker-entrypoint.sh` | 把 `DERP_*` 环境变量翻译成 derper 参数 |
-| `docker-compose.yml` | 部署示例 |
+| `docker-compose.yml` | Docker Compose 部署示例 |
 | `versions.json` | 工作流自动维护的最近一次发布记录 |
