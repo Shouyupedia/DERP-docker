@@ -1,0 +1,302 @@
+# Builds Tailscale's DERP relay (cmd/derper) from the latest upstream release
+# with the latest stable Go, and publishes a multi-arch image to GHCR
+# (optionally also Docker Hub).
+#
+# Every run first resolves the current upstream versions. One build is keyed by
+# the pair "<tailscale tag>-go<go version>" (for example v1.104.5-go1.27.3), so a
+# new Tailscale release OR a new Go release produces a new image, while a run
+# that finds the pair already published does nothing.
+name: Build derper image
+
+on:
+  schedule:
+    # Every 6 hours. Cheap when nothing changed: a few API calls, no build.
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tailscale_version:
+        description: 'Tailscale tag to build (e.g. v1.104.5). Empty = latest release.'
+        required: false
+        default: ''
+      go_version:
+        description: 'Go version to build with (e.g. 1.27.3). Empty = latest stable.'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild and re-push even if this version pair is already published'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - docker-entrypoint.sh
+      - .github/workflows/build.yml
+
+permissions:
+  contents: write # commit versions.json after a successful publish
+  packages: write # push to ghcr.io
+
+concurrency:
+  group: build-derper
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: derper
+  PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
+
+jobs:
+  resolve:
+    name: Resolve upstream versions
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_ENABLED: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      reason: ${{ steps.decide.outputs.reason }}
+      image: ${{ steps.image.outputs.image }}
+      ts_version: ${{ steps.versions.outputs.ts_version }}
+      ts_minor: ${{ steps.versions.outputs.ts_minor }}
+      ts_commit: ${{ steps.versions.outputs.ts_commit }}
+      go_version: ${{ steps.versions.outputs.go_version }}
+      go_min: ${{ steps.versions.outputs.go_min }}
+      go_latest: ${{ steps.versions.outputs.go_latest }}
+      image_tag: ${{ steps.versions.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Image name
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "image=${REGISTRY}/${OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Tailscale and Go versions
+        id: versions
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TS_VERSION_OVERRIDE: ${{ inputs.tailscale_version }}
+          GO_VERSION_OVERRIDE: ${{ inputs.go_version }}
+        run: ./scripts/resolve-versions.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Optional: authenticated Docker Hub checks are not subject to the
+      # anonymous pull rate limit.
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_ENABLED == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          IMAGE_TAG: ${{ steps.versions.outputs.image_tag }}
+          GO_VERSION: ${{ steps.versions.outputs.go_version }}
+          FORCE: ${{ inputs.force == true || github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          golang_ref="docker.io/library/golang:${GO_VERSION}"
+          target_ref="${IMAGE}:${IMAGE_TAG}"
+          build=true
+          reason="${target_ref} is not published yet"
+
+          # The official golang image usually appears a few hours after a Go
+          # release. If it is not there yet, skip quietly; the next scheduled
+          # run retries. Any other registry error is surfaced as a failure.
+          if ! out="$(docker buildx imagetools inspect "$golang_ref" 2>&1)"; then
+            if grep -qiE 'not found|manifest unknown' <<<"$out"; then
+              build=false
+              reason="${golang_ref} is not on Docker Hub yet; retrying on the next run"
+              echo "::warning::${reason}"
+            else
+              echo "::error::could not inspect ${golang_ref}: ${out}"
+              exit 1
+            fi
+          elif [ "$FORCE" = "true" ]; then
+            reason="forced rebuild (${GITHUB_EVENT_NAME})"
+          elif docker buildx imagetools inspect "$target_ref" >/dev/null 2>&1; then
+            build=false
+            reason="${target_ref} is already published"
+          fi
+
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+          echo "${reason}"
+
+      - name: Summary
+        env:
+          TS_VERSION: ${{ steps.versions.outputs.ts_version }}
+          TS_COMMIT: ${{ steps.versions.outputs.ts_commit }}
+          GO_VERSION: ${{ steps.versions.outputs.go_version }}
+          GO_MIN: ${{ steps.versions.outputs.go_min }}
+          GO_LATEST: ${{ steps.versions.outputs.go_latest }}
+          IMAGE_TAG: ${{ steps.versions.outputs.image_tag }}
+          BUILD: ${{ steps.decide.outputs.build }}
+          REASON: ${{ steps.decide.outputs.reason }}
+        run: |
+          {
+            echo "## derper build decision"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tailscale | \`${TS_VERSION}\` (\`${TS_COMMIT}\`) |"
+            echo "| Go | \`${GO_VERSION}\` (go.mod minimum \`${GO_MIN}\`, latest stable \`${GO_LATEST}\`) |"
+            echo "| Image tag | \`${IMAGE_TAG}\` |"
+            echo "| Build | **${BUILD}** — ${REASON} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build and publish
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # Docker Hub publishing is optional: add DOCKERHUB_USERNAME and
+      # DOCKERHUB_TOKEN repository secrets to enable it.
+      DOCKERHUB_ENABLED: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+      IMAGE: ${{ needs.resolve.outputs.image }}
+      IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+      TS_VERSION: ${{ needs.resolve.outputs.ts_version }}
+      TS_COMMIT: ${{ needs.resolve.outputs.ts_commit }}
+      GO_VERSION: ${{ needs.resolve.outputs.go_version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_ENABLED == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: |
+            ${{ env.IMAGE }}
+            name=docker.io/${{ secrets.DOCKERHUB_USERNAME || 'unused' }}/${{ env.IMAGE_NAME }},enable=${{ env.DOCKERHUB_ENABLED == 'true' }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ env.TS_VERSION }}
+            type=raw,value=${{ needs.resolve.outputs.ts_minor }}
+            type=raw,value=${{ env.IMAGE_TAG }}
+          labels: |
+            org.opencontainers.image.title=derper
+            org.opencontainers.image.description=Tailscale DERP relay server (cmd/derper) ${{ env.TS_VERSION }}, built with Go ${{ env.GO_VERSION }}
+            org.opencontainers.image.version=${{ env.TS_VERSION }}
+            io.tailscale.derper.version=${{ env.TS_VERSION }}
+            io.tailscale.derper.commit=${{ env.TS_COMMIT }}
+            io.tailscale.derper.source=https://github.com/tailscale/tailscale/tree/${{ env.TS_VERSION }}
+            io.tailscale.derper.go-version=${{ env.GO_VERSION }}
+
+      - name: Build for the runner platform
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: derper:smoke
+          build-args: |
+            GO_VERSION=${{ env.GO_VERSION }}
+            TS_VERSION=${{ env.TS_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm derper:smoke --version)"
+          echo "derper --version: ${out}"
+          # Expect upstream's stamped form, e.g. 1.104.5-t73a48057a
+          expected="${TS_VERSION#v}-t${TS_COMMIT:0:9}"
+          [ "$out" = "$expected" ] || { echo "::error::expected '${expected}'"; exit 1; }
+          # Environment-driven entrypoint must reach derper (it fails on the
+          # missing TLS cert, which proves the flags were assembled and parsed).
+          out="$(docker run --rm -e DERP_HOSTNAME=derp.example.com -e DERP_CERT_MODE=manual derper:smoke 2>&1 || true)"
+          echo "${out}"
+          grep -q 'derp.example.com' <<<"${out}" || { echo "::error::entrypoint did not pass DERP_HOSTNAME through to derper"; exit 1; }
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            GO_VERSION=${{ env.GO_VERSION }}
+            TS_VERSION=${{ env.TS_VERSION }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify the published image on every platform
+        run: |
+          set -euo pipefail
+          IFS=, read -ra platforms <<<"${PLATFORMS}"
+          for p in "${platforms[@]}"; do
+            printf '%-14s ' "$p"
+            docker run --rm --platform "$p" "${IMAGE}:${IMAGE_TAG}" --version
+          done
+
+      - name: Record published versions
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg tailscale "$TS_VERSION" \
+            --arg tailscale_commit "$TS_COMMIT" \
+            --arg go "$GO_VERSION" \
+            --arg image "${IMAGE}:${IMAGE_TAG}" \
+            '{tailscale: $tailscale, tailscale_commit: $tailscale_commit, go: $go, image: $image}' \
+            > versions.json
+          git add versions.json
+          if git diff --cached --quiet; then
+            echo "versions.json unchanged"; exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore: publish derper ${IMAGE_TAG}"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "## Published derper ${IMAGE_TAG}"
+            echo
+            echo "Tailscale \`${TS_VERSION}\` (\`${TS_COMMIT}\`), Go \`${GO_VERSION}\`, platforms \`${PLATFORMS}\`"
+            echo
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
