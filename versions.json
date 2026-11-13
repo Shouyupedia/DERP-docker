@@ -1,6 +1,6 @@
 {
-  "tailscale": "v1.104.6",
-  "tailscale_commit": "c54807352ae196919497b3f8fddc3cedf88368b9",
+  "tailscale": "v1.104.7",
+  "tailscale_commit": "cbc74fe48ef1b1649f69a4d9a602319427e25102",
   "go": "1.27.4",
-  "image": "ghcr.io/shouyupedia/derper:v1.104.6-go1.27.4"
+  "image": "ghcr.io/shouyupedia/derper:v1.104.7-go1.27.4"
 }
